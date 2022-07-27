@@ -1,0 +1,169 @@
+include: jobs.yml
+
+variables:
+  KUBERNETES_LINT_IMAGE: stackrox/kube-linter:0.4.0
+  LINT_DIR: tmp
+  LINT_FILE: full-k8s-chart.yaml
+
+.helm-prepare:
+  script:
+    - set -x && exec 2>&1
+    # prepare environment vars and helm flags
+    - export HELM_REPO_PATH="https://company.com/helm-repository/"
+    - export HELM_REPO_NAME="chat-helm"
+    - export TARGET_NAMESPACE="chat-platform"
+    - export INGRESS_NAMESPACE="emissary"
+    - export UPPER_CD_ENVIRONMENT=$(echo $CI_ENVIRONMENT_NAME | tr '[:lower:]' '[:upper:]')
+    - export TKGI_PASS=$(eval echo \$$(echo SUDO_PASSWORD_${UPPER_CD_ENVIRONMENT}))
+    - export TKGI_USER=$(eval echo \$$(echo ANSIBLE_USER_${UPPER_CD_ENVIRONMENT}))
+    - export TKGI_MASTER_ADDR=$(eval echo \$$(echo TKGI_MASTER_${UPPER_CD_ENVIRONMENT}))
+    - export TKGI_CONTEXT=$(eval echo \$$(echo TKGI_CONTEXT_${UPPER_CD_ENVIRONMENT}))
+    - export HELM_SET_FLAGS=$(echo $(eval echo \$$(echo HELM_SET_PARAMS_${UPPER_CD_ENVIRONMENT})) | tr '\n' ' ')
+    - if [[ ! -z r"$(eval echo \$$(echo HELM_SET_FILE_PARAMS_${UPPER_CD_ENVIRONMENT}))" ]]; then
+      echo "Variable HELM_SET_FILE_PARAMS exist";
+      export RAW_HELM_SET_FILE_FLAGS=$(echo $(eval echo \$$(echo HELM_SET_FILE_PARAMS_${UPPER_CD_ENVIRONMENT})) | tr '\n' ' ');
+      else
+      echo "Variable HELM_SET_FILE_PARAMS_${UPPER_CD_ENVIRONMENT} doesn't exist";
+      export RAW_HELM_SET_FILE_FLAGS="";
+      fi;
+    - export HELM_SET_FILE_FLAGS=$(eval echo ${RAW_HELM_SET_FILE_FLAGS//\=/\=$})
+    - echo 'Helm params:' $HELM_SET_FLAGS
+    - echo 'Helm file params:' $HELM_SET_FILE_FLAGS
+    # run deployment
+    - pks get-kubeconfig $TKGI_CONTEXT -u $TKGI_USER -a $TKGI_MASTER_ADDR -k -p $TKGI_PASS
+    - kubectl config use-context $TKGI_CONTEXT
+    # Check existance of namespace
+    - if [ $(kubectl get namespace | grep "$TARGET_NAMESPACE" | wc -l) == '1' ]; then echo "Namespace $TARGET_NAMESPACE already exist"; else kubectl create namespace $TARGET_NAMESPACE; fi
+    - if [ $(kubectl get namespace | grep "$INGRESS_NAMESPACE" | wc -l) == '1' ]; then echo "Namespace $INGRESS_NAMESPACE already exist"; else kubectl create namespace $INGRESS_NAMESPACE; fi
+    # Add labels for namespace
+    - kubectl label namespaces $TARGET_NAMESPACE name=$TARGET_NAMESPACE --overwrite=true
+    - kubectl label namespaces $INGRESS_NAMESPACE name=$INGRESS_NAMESPACE --overwrite=true
+    # Add helm repo
+    - helm3 repo add $HELM_REPO_NAME $HELM_REPO_PATH --username=$TKGI_USER --password=$TKGI_PASS
+    # Helm repo and dependency update
+    - helm3 repo update
+    - helm3 dependency update k8s
+    # TODO: do something with iac
+    - if [ "$CI_ENVIRONMENT_NAME" = prev ] && [ "$CI_PROJECT_NAME" != iac ] && [[ ! -n "$FULL_DOCKER_TAG" ]]; then
+      set +e;
+      helm3 -n$TARGET_NAMESPACE uninstall $CI_PROJECT_NAME;
+      set -e;
+      fi;
+    - if [[ -n "$FULL_DOCKER_TAG" ]]; then SET_RELEASE_IMAGE="--set image=$FULL_DOCKER_TAG"; fi;
+    - COLON=":" && echo "appVersion${COLON} ${DOCKER_IMAGE_VERSION}" >> k8s/Chart.yaml
+    - echo $(echo "$HELM_SET_FLAGS" | sed 's/DOUBLEQUOTE/"/g')
+
+.helm-upgrade:
+  script:
+    - if [ "$CI_ENVIRONMENT_NAME" = dev ]; then
+      VALUES_FILE="k8s/envs/local.yaml"; else
+      VALUES_FILE="k8s/envs/$CI_ENVIRONMENT_NAME.yaml";
+      fi;
+    - helm3 upgrade -i -n$TARGET_NAMESPACE -f $VALUES_FILE $HELM_SET_FLAGS --set common.environment=$CI_ENVIRONMENT_NAME $HELM_SET_FILE_FLAGS $SET_RELEASE_IMAGE $CI_PROJECT_NAME k8s
+
+.helm-dry-run:
+  script:
+    - LINT_DIR=$(pwd)/$LINT_DIR
+    - mkdir $LINT_DIR
+    - helm3 upgrade -i -n$TARGET_NAMESPACE -f k8s/envs/$CI_ENVIRONMENT_NAME.yaml $HELM_SET_FLAGS $HELM_SET_FILE_FLAGS $SET_RELEASE_IMAGE $CI_PROJECT_NAME k8s --debug --dry-run 2>/dev/null | grep -v 'Happy Helming' > $LINT_DIR/$LINT_FILE
+
+.tag-release-job:
+  extends:
+    - .default-job
+    - .restricted-for-tag
+  stage: .post
+  script:
+    - eval $CMD_CLONE_TOOLSET
+    - python3.8 -m pip install semver GitPython
+    - python3.8 $TOOLSET_SCRIPTS_PATH/mark-release-tag.py
+  allow_failure: true
+
+.kube-linter:
+  stage: test
+  extends: .default-docker-dind-job
+  allow_failure: true
+  script:
+    - !reference [.docker-login-arti, script]
+    - !reference [.prepare-build-tag, script]
+    - !reference [.helm-prepare, script]
+    - !reference [.helm-dry-run, script]
+    - docker run -v $LINT_DIR:/lint $KUBERNETES_LINT_IMAGE lint /lint/$LINT_FILE --add-all-built-in 2>lint.err || true
+    - cat lint.err >&2
+    - !reference [.docker-logout-arti, script]
+
+check-necessary-k8s-vars:
+  extends: .vars-check-job
+  script:
+    - echo $CI_PROJECT_NAME
+
+prev-lint-kube:
+  extends: .kube-linter
+  variables:
+    CI_ENVIRONMENT_NAME: prev
+
+prod-lint-kube:
+  extends: .kube-linter
+  variables:
+    CI_ENVIRONMENT_NAME: prod
+
+deploy-dev:
+  stage: deploy
+  environment:
+    name: dev
+  script:
+    - !reference [.prepare-build-tag, script]
+    - !reference [.helm-prepare, script]
+    - !reference [.helm-upgrade, script]
+  variables:
+    CI_ENVIRONMENT_NAME: dev
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_COMMIT_TAG != "release-prev" && $CI_COMMIT_TAG != "release-prod"'
+      when: always
+    - if: r'$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: always
+
+deploy-preview:
+  stage: deploy
+  environment:
+    name: prev
+  script:
+    - !reference [.prepare-build-tag, script]
+    - !reference [.helm-prepare, script]
+    - !reference [.helm-upgrade, script]
+  variables:
+    CI_ENVIRONMENT_NAME: prev
+  allow_failure: true
+  rules:
+    - if: r'$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      #when: manual
+
+deploy-production:
+  stage: deploy
+  environment:
+    name: prod
+  extends: .default-docker-dind-job
+  script:
+    - !reference [.restricted-for-devops-job, script]
+    - !reference [.prepare-build-tag, script]
+    - !reference [.helm-prepare, script]
+    - !reference [.helm-upgrade, script]
+    - !reference [.docker-logout-arti, script]
+  variables:
+    CI_ENVIRONMENT_NAME: prod
+  allow_failure: true
+  rules:
+    - if: r'$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+
+tag-prev-after-release:
+  extends: .tag-release-job
+  needs: ["deploy-preview"]
+  variables:
+    CI_ENVIRONMENT_NAME: prev
+
+tag-prod-after-release:
+  extends: .tag-release-job
+  needs: ["deploy-production"]
+  variables:
+    CI_ENVIRONMENT_NAME: prod

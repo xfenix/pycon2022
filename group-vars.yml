@@ -1,0 +1,9 @@
+variables:
+  SONAR_HOST_URL: "https://my-sonar.company.com/"
+  SONAR_CRITICAL_COUNT: "15"
+  ANSIBLE_USER_PROD: "my-fancy-user"
+  ANSIBLE_USER_PREV: "not-fancy-user"
+  ANSIBLE_USER_DEV: "dev-user"
+  K8S_MASTER_PREV: "master.k8s.dev"
+  K8S_MASTER_PROD: "master.k8s.prod"
+  HTTPS_INTERNET_PROXY: "https://fancy-proxy.company.ru:8080/"

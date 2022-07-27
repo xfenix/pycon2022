@@ -1,0 +1,433 @@
+variables:
+  TOOLSET_FOLDER_NAME: .
+  TOOLSET_PATH: ./$TOOLSET_FOLDER_NAME
+  TOOLSET_SCRIPTS_PATH: ./$TOOLSET_FOLDER_NAME/script/
+  PROJ_DIR_IN_DOCKER: /srv/www
+  DOCKER_REGISTRY_HOST: my-company.gitlab.com
+  DOCKER_TEAM_REGISTRY_PREFIX: my-team
+  DOCKER_PRODUCTION_TAG_BODY: $DOCKER_REGISTRY_HOST/$DOCKER_TEAM_REGISTRY_PREFIX/$PROJECT_SLUG/$CI_PROJECT_NAME
+  DOCKER_IMAGE_FOR_CI: docker:20.10.17
+  PODMAN_IMAGE_FOR_CI: $DOCKER_REGISTRY_HOST/$DOCKER_TEAM_REGISTRY_PREFIX/custom-techimage/buildah-podman:1.23.1
+  PYTHON_IMAGE_FOR_CI: python:3.10.5-slim
+  PYPI_DESTINATION: https://my-fancy.pypi.org/api/pypi/my-cool-tema
+  STATUS_FILE_NAME_IN_DOCKER: status.json
+  CMD_CLONE_TOOLSET: git clone https://my-gitlab.gitlab.com/xfenix/pycon2022.git $TOOLSET_PATH
+
+.login-to-docker-registry:
+  script:
+    - echo "$DOCKER_REGISTRY_PASSWORD" | docker login -u $DOCKER_REGISTRY_USER --password-stdin $DOCKER_REGISTRY_HOST
+
+.logout-from-docker-registry:
+  script:
+    - docker logout $DOCKER_REGISTRY_HOST
+
+.podman-login-to-docker-registry:
+  script:
+    - buildah login -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD $DOCKER_REGISTRY_HOST
+
+.podman-logout-arti:
+  script:
+    - buildah logout --all
+
+.default-job:
+  interruptible: true
+  retry: 2
+  tags:
+    - next_gen
+  rules:
+    - if: '$CI_COMMIT_TAG == "release-prev" || $CI_COMMIT_TAG == "release-prod"'
+      when: never
+    - when: always
+
+.default-docker-dind-job:
+  extends: .default-job
+  # BEWARE: dind lie here because otherwise docker cli does not work
+  services:
+    - name: artifactory.raiffeisen.ru/ext-rbru-devimage-container-docker/dind:19.03-centos-rbru
+      alias: dind
+  variables:
+    DOCKER_HOST: tcp://dind:2375
+
+.default-docker-cli-job:
+  extends: .default-job
+  image: $PODMAN_IMAGE_FOR_CI
+  variables:
+    STORAGE_DRIVER: vfs
+
+.python-base-image-dockerized-job:
+  extends: .default-job
+  image: $PYTHON_IMAGE_FOR_CI
+  before_script:
+    - arti-pip -a begin -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD
+  after_script:
+    - arti-pip -a end
+
+# my-registry.gitlab.com/cli-for-ci — образ, где стоит ldapsearch и cowpy
+.restricted-for-devops-job:
+  # required extends: .default-docker-dind-job where it will be used
+  script:
+    - !reference [.login-to-docker-registry, script]
+    - docker pull my-registry.gitlab.com/cli-for-ci:1.1.0 1>/dev/null 2>/dev/null
+    - export POSSIBLE_DEVOPS_COUNT=$(
+      docker run my-registry.gitlab.com/cli-for-ci:1.1.0
+      ldapsearch
+      -LLL
+      -x
+      -o ldif-wrap=no
+      -D "$DOCKER_REGISTRY_USER"
+      -w "$DOCKER_REGISTRY_PASSWORD"
+      -H "ldaps://my-ldap.server.com"
+      -b "cn=...,ou=...,ou=COMMON,ou=...,dc=...,dc=..." 2>/dev/null |
+      grep -i My-Ldap-Group |
+      wc -l)
+    - if [[ $POSSIBLE_DEVOPS_COUNT -eq 0 ]]; then
+      docker run -t my-registry.gitlab.com/cli-for-ci:1.0.0
+      cowpy -c ghostbusters 'For your user deploy is FORBIDDEN. Please contact to /dev/null';
+      exit 100;
+      fi
+
+.restricted-for-tag:
+  rules:
+    - if: r'$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
+.prepare-build-tag:
+  # provide FULL_DOCKER_TAG for other steps
+  # result FULL_DOCKER_TAG will be like this
+  # - if branch is master + tag, then my-docker-registry.company.com/service/release:1.2.3
+  # - if branch is master, then my-docker-registry.company.com/service/master:latest
+  script:
+    - set -x
+    # provide DOCKER_IMAGE_VERSION and DOCKER_IMAGE_NAME for other steps
+    # parse last tag and remove "v" letter from if we have tag, otherwise return latest
+    # release folder for tagged and master for others
+    - export DOCKER_IMAGE_VERSION=$(if [[ $CI_COMMIT_TAG ]]; then echo ${CI_COMMIT_TAG/v}; else echo latest; fi)
+    - export DOCKER_IMAGE_NAME=$(if [[ $CI_COMMIT_TAG ]]; then echo release; else echo $CI_COMMIT_BRANCH; fi)
+    - export DOCKER_TAG_FOR_CI=$DOCKER_PRODUCTION_TAG_BODY/ci:$CI_COMMIT_SHORT_SHA
+    - export ARTIFACTORY_URL_FOR_DELETE_CI=https://$DOCKER_REGISTRY_HOST/artifactory/$DOCKER_TEAM_REGISTRY_PREFIX/$PROJECT_SLUG/$CI_PROJECT_NAME/ci/$CI_COMMIT_SHORT_SHA
+    - export FULL_DOCKER_TAG=$DOCKER_PRODUCTION_TAG_BODY/$DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION
+    - echo $TOOLSET_PATH "\nbin/scrips/\n*.xml\n*.md\n*.ini\n.git*\n.*rc\n.dockerignore\n.scannerwork\nservice-preview.png\ndoc/\n" >> .dockerignore
+    # place status file in each container
+    - 'echo "{\"version\": \"$DOCKER_IMAGE_VERSION\", \"service\": \"$CI_PROJECT_NAME\", \"project\": \"$PROJECT_SLUG\"}" > $STATUS_FILE_NAME_IN_DOCKER'
+
+.build-docker-job:
+  extends:
+    - .default-docker-cli-job
+  stage: build
+  variables:
+    DOCKEFILE_DESTINATION: .
+  script:
+    - set -x
+    - !reference [.prepare-build-tag, script]
+    - !reference [.podman-login-to-docker-registry, script]
+    - echo "Building docker image with tag $DOCKER_TAG_FOR_CI"
+    - buildah bud
+      --jobs=0
+      --format=docker
+      -t $DOCKER_TAG_FOR_CI
+      --build-arg DOCKER_REGISTRY_USER=$DOCKER_REGISTRY_USER
+      --build-arg DOCKER_REGISTRY_PASSWORD=$DOCKER_REGISTRY_PASSWORD
+      $CI_PROJECT_DIR/Dockerfile
+    - buildah push $DOCKER_TAG_FOR_CI
+
+.publish-docker-image:
+  extends: .default-docker-cli-job
+  stage: after-test
+  variables:
+    DOCKEFILE_DESTINATION: .
+  script:
+    - set -x
+    - !reference [.prepare-build-tag, script]
+    - echo ${FULL_DOCKER_TAG?-Undefined FULL_DOCKER_TAG var}
+    - echo ${DOCKER_TAG_FOR_CI?-Undefined DOCKER_TAG_FOR_CI var}
+    - !reference [.podman-login-to-docker-registry, script]
+    - echo "Publish docker image with tag $FULL_DOCKER_TAG"
+    - skopeo copy docker://$DOCKER_TAG_FOR_CI docker://$FULL_DOCKER_TAG
+    - !reference [.podman-logout-arti, script]
+  rules:
+    - if: r'$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
+.clean-current-docker-image:
+  stage: deploy
+  script:
+    - !reference [.prepare-build-tag, script]
+    - curl -"$DOCKER_REGISTRY_USER:$DOCKER_REGISTRY_PASSWORD" -X DELETE "$ARTIFACTORY_URL_FOR_DELETE_CI"
+  rules:
+    - if: '$CI_COMMIT_TAG == "release-prev" || $CI_COMMIT_TAG == "release-prod"'
+      when: never
+    - when: always
+
+.vars-check-job:
+  # for checking necessary vars
+  extends: .default-job
+  image: $DOCKER_IMAGE_FOR_CI
+  stage: .pre
+  before_script:
+    - set -u
+
+.auto-semver:
+  extends: .default-job
+  stage: deploy
+  script:
+    - eval $CMD_CLONE_TOOLSET
+    - python3 -m pip install semver GitPython
+    - python3 $TOOLSET_SCRIPTS_PATH/auto-semver.py version
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+
+.tag-release-job:
+  extends:
+    - .default-job
+    - .restricted-for-tag
+  stage: .post
+  script:
+    - eval $CMD_CLONE_TOOLSET
+    - python3 -m pip install semver GitPython
+    - python3 $TOOLSET_SCRIPTS_PATH/auto-semver.py mark
+  allow_failure: true
+
+.keydb-test:
+  services:
+    - name: eqalpha/keydb:x86_64_v6.0.16
+      alias: keydb-test-server-0
+  variables:
+    SENTINEL_NAME: keydb-test-server
+    SENTINEL_MASTER_NAME: test-master
+
+.after-test-run:
+  script:
+    - podman cp $RAND_DOCKER_NAME_FOR_SYNC:$OUT_DIR_IN_DOCKER/$JUNIT_FILE_NAME $JUNIT_FILE_NAME
+    - podman cp $RAND_DOCKER_NAME_FOR_SYNC:$OUT_DIR_IN_DOCKER/$COVERAGE_FILE_NAME $COVERAGE_FILE_NAME
+    - podman container rm $RAND_DOCKER_NAME_FOR_SYNC
+    # replace paths: docker inner with real CI worker path
+    # weird construction? this is because we have /srv/www and /srv/www/ paths in file and dont
+    # want to get result as like this: /some/path//...
+    - export DESIRED_DIR_FOR_REPORT=$(pwd)
+    - sed -i -e 's#'$PROJ_DIR_IN_DOCKER'#'$DESIRED_DIR_FOR_REPORT'#g' $JUNIT_FILE_NAME 2>/dev/null
+    - sed -i -e 's#'$PROJ_DIR_IN_DOCKER'#'$DESIRED_DIR_FOR_REPORT'#g' $COVERAGE_FILE_NAME 2>/dev/null
+    # remove plugins in pylint config (sonar compatibility)
+    - if [ -e ".pylintrc" ]; then
+      sed -i -e 's#$load-plugins=.*#load-plugins=#g' .pylintrc 2>/dev/null;
+      fi
+
+.scan-with-sonar:
+  extends: .default-job
+  stage: after-test
+  before_script:
+    - export INCLUSIONS_PATTERN=**/*.py
+    - export EXCLUSIONS_PATTERN=**/migrations/*.py,bin/**,doc/**,$TOOLSET_FOLDER_NAME/**
+  script:
+    - set -u; echo $INCLUSIONS_PATTERN $EXCLUSIONS_PATTERN; set +u
+    - set -x
+    - sonar-scanner -X
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+      -Dsonar.python.xunit.reportPath=$JUNIT_FILE_NAME
+      -Dsonar.python.coverage.reportPaths=$COVERAGE_FILE_NAME
+      -Dsonar.sources=.
+      -Dsonar.inclusions=$INCLUSIONS_PATTERN
+      -Dsonar.exclusions=$EXCLUSIONS_PATTERN
+      -Dsonar.projectKey=nonvoice.$CI_PROJECT_PATH_SLUG
+      -Dsonar.projectName=$(python -c "print('$CI_PROJECT_PATH_SLUG'.title())")
+      -Dsonar.gitlab.commit_sha=$CI_COMMIT_SHA
+      -Dsonar.gitlab.ref_name=$CI_COMMIT_REF_NAME
+      -Dsonar.gitlab.project_id=$CI_PROJECT_PATH
+      -Dsonar.gitlab.max_critical_issues_gate=$SONAR_CRITICAL_COUNT
+      -Dsonar.branch.name=$CI_COMMIT_REF_NAME
+
+.lint-python:
+  stage: test
+  extends: .default-docker-cli-job
+  script:
+    # install current pylint & mypy, then run linting with them
+    - set -x
+    - !reference [.podman-login-to-docker-registry, script]
+    - eval $CMD_CLONE_TOOLSET
+    - !reference [.prepare-build-tag, script]
+    - >-
+      podman run
+      -v $TOOLSET_PATH:/$TOOLSET_PATH
+      -t $DOCKER_TAG_FOR_CI
+      bash -c "if id python > /dev/null 2>&1; then runAs='--user python'; fi &&
+      pip3 install $runAs -U 'pylint==2.12.2' 'mypy==0.942' 'isort==5.10.1' 'black==22.3.0' &&
+
+      /$TOOLSET_SCRIPTS_PATH/lint.py
+      -project_dir=$PROJ_DIR_IN_DOCKER
+      -action=lint_pylint
+      -pylint_args='$PYLINT_ARGS'
+      -pylint_score=${PYLINT_SCORE:-10.0} &&
+
+      /$TOOLSET_SCRIPTS_PATH/lint.py
+      -project_dir=$PROJ_DIR_IN_DOCKER
+      -action=lint_mypy
+      -extra_mypy_args='$EXTRA_MYPY_ARGS'
+      -mypy_score=${MYPY_SCORE:-0}  &&
+
+      python -m isort **/*.py --check --diff &&
+
+      python -m black **/*.py --check --diff"
+    - !reference [.podman-logout-arti, script]
+
+.lint-dockerfile:
+  stage: test
+  image: $DOCKER_IMAGE_FOR_CI
+  extends: .default-docker-dind-job
+  script:
+    - !reference [.login-to-docker-registry, script]
+    - docker run --rm -i hadolint:v2.9.3 hadolint -t error - < Dockerfile
+    - !reference [.logout-from-docker-registry, script]
+
+# Generic template of test job (will be customized or completely modified in children pipelines)
+.python-test-job:
+  stage: test
+  extends: .default-docker-cli-job
+  services: !reference [.keydb-test, services]
+  variables:
+    SENTINEL_NAME: !reference [.keydb-test, variables, SENTINEL_NAME]
+    SENTINEL_MASTER_NAME:
+      !reference [.keydb-test, variables, SENTINEL_MASTER_NAME]
+    FF_NETWORK_PER_BUILD: "1"
+  script:
+    - echo "run tests"
+    - !reference [.prepare-build-tag, script]
+    - !reference [.podman-login-to-docker-registry, script]
+    - set -x
+    - eval $CMD_CLONE_TOOLSET
+    - export RAND_DOCKER_NAME_FOR_SYNC=$($TOOLSET_SCRIPTS_PATH/gen-random-str.py)
+    - export TEST_DB_IP_ADDR=$(cat /etc/hosts | grep "runner-" | awk '{print $1}')
+    - export SENTINEL_NAME_VARIABLE_FOR_CONTAINER=${SENTINEL_NAME_VARIABLE:-default}
+    - export SENTINEL_MASTER_NAME_VARIABLE_FOR_CONTAINER=${SENTINEL_MASTER_NAME_VARIABLE:-default}
+    - >-
+      podman run
+      --add-host="$SENTINEL_NAME-0:${TEST_DB_IP_ADDR}"
+      --name $RAND_DOCKER_NAME_FOR_SYNC
+      -e $SENTINEL_NAME_VARIABLE_FOR_CONTAINER=$SENTINEL_NAME
+      -e $SENTINEL_MASTER_NAME_VARIABLE_FOR_CONTAINER=$SENTINEL_MASTER_NAME
+      -v $TOOLSET_PATH:/$TOOLSET_FOLDER_NAME
+      -t $DOCKER_TAG_FOR_CI
+      bash -c "eval ${BEFORE_TESTS_HOOK:-} && NV_ENVIRONMENT=test pytest ${PYTEST_WORKERS_INFIX:--n3}
+      --ignore $TOOLSET_FOLDER_NAME
+      --junitxml=$OUT_DIR_IN_DOCKER/$JUNIT_FILE_NAME --cov-report term-missing
+      --cov-report xml:$OUT_DIR_IN_DOCKER/$COVERAGE_FILE_NAME --cov=."
+    - !reference [.after-test-run, script]
+    - !reference [.podman-logout-arti, script]
+  artifacts:
+    expire_in: 30 days
+    # for inner gitlab reporting system
+    reports:
+      junit: $JUNIT_FILE_NAME
+      cobertura: $COVERAGE_FILE_NAME
+    # for external sonar task
+    paths:
+      - $JUNIT_FILE_NAME
+      - $COVERAGE_FILE_NAME
+
+.python-postgres-test-job:
+  stage: test
+  extends: .default-docker-cli-job
+  variables:
+    POSTGRES_USER: simpleuser
+    POSTGRES_PASSWORD: 111
+    POSTGRES_DB: db-for-tests
+    POSTGRES_HOST_AUTH_METHOD: trust
+    DB_HOST: test-server
+    DB_PORT: 5432
+    SENTINEL_NAME: !reference [.keydb-test, variables, SENTINEL_NAME]
+    SENTINEL_MASTER_NAME:
+      !reference [.keydb-test, variables, SENTINEL_MASTER_NAME]
+    DOCKER_HOST: tcp://leo-dind:2375
+    DOCKER_DRIVER: overlay2
+    FF_NETWORK_PER_BUILD: "1"
+  services:
+    - name: postgres:14-alpine
+      alias: test-server
+      command:
+        ["postgres", "-c", "shared_buffers=256MB", "-c", "max_connections=420"]
+    - !reference [.keydb-test, services]
+  tags:
+    - next_gen
+  image: $PODMAN_IMAGE_FOR_CI
+  script:
+    - export BEFORE_TESTS_HOOK="${BEFORE_TESTS_HOOK:-alembic upgrade head}"
+    - set -x
+    - !reference [.prepare-build-tag, script]
+    - !reference [.podman-login-arti, script]
+    - eval $CMD_CLONE_TOOLSET
+    - export RAND_DOCKER_NAME_FOR_SYNC=$($TOOLSET_SCRIPTS_PATH/gen-random-str.py)
+    - export SENTINEL_NAME_VARIABLE_FOR_CONTAINER=${SENTINEL_NAME_VARIABLE:-default}
+    - export SENTINEL_MASTER_NAME_VARIABLE_FOR_CONTAINER=${SENTINEL_MASTER_NAME_VARIABLE:-default}
+    # - export TEST_DB_IP_ADDR=$(cat /etc/hosts | grep $DB_HOST | awk '{print $1}')
+    # cant say why, but we can grep by runner- prefix
+    - export TEST_DB_IP_ADDR=$(cat /etc/hosts | grep "runner-" | awk '{print $1}')
+    - podman run
+      -v $TOOLSET_PATH:/$TOOLSET_PATH
+      --add-host="$DB_HOST:${TEST_DB_IP_ADDR}"
+      --add-host="$SENTINEL_NAME-0:${TEST_DB_IP_ADDR}"
+      --name $RAND_DOCKER_NAME_FOR_SYNC
+      -e $DSN_VARIABLE_NAME=postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$DB_HOST:$DB_PORT/$POSTGRES_DB
+      -e $SENTINEL_NAME_VARIABLE_FOR_CONTAINER=$SENTINEL_NAME
+      -e $SENTINEL_MASTER_NAME_VARIABLE_FOR_CONTAINER=$SENTINEL_MASTER_NAME
+      -e NV_ENVIRONMENT=test
+      -t $DOCKER_TAG_FOR_CI
+      bash -c "eval ${BEFORE_TESTS_HOOK:-} && pytest ${PYTEST_WORKERS_INFIX:--n3} --ignore $TOOLSET_PATH
+      --junitxml=$OUT_DIR_IN_DOCKER/$JUNIT_FILE_NAME --cov-report term-missing
+      --cov-report xml:$OUT_DIR_IN_DOCKER/$COVERAGE_FILE_NAME --cov=."
+    # copy reports from docker container, then clean container
+    - !reference [.after-test-run, script]
+    - !reference [.podman-logout-arti, script]
+  artifacts:
+    expire_in: 30 days
+    # for inner gitlab reporting system
+    reports:
+      junit: $JUNIT_FILE_NAME
+      cobertura: $COVERAGE_FILE_NAME
+    # for external sonar task
+    paths:
+      - $JUNIT_FILE_NAME
+      - $COVERAGE_FILE_NAME
+
+.pypi-build-with-pip:
+  stage: deploy
+  extends: .python-base-image-dockerized-job
+  script:
+    - pip install twine
+    # python setup.py install only via pip (yeap)
+    # check that package can be installed
+    - pip install -e .
+    # prevents republish of already published versions
+    - export PYPI_PACKAGE=$(
+      pip search $(python setup.py --name)
+      --index $PYPI_DESTINATION)
+    - arti-pip -a end
+    - if [[ $PYPI_PACKAGE == *"($(python setup.py -V))"* ]]; then
+      echo "Publish skipped. Version already in the PyPI";
+      exit 1;
+      fi;
+    # publish itself
+    - python setup.py bdist_wheel
+    - CURL_CA_BUNDLE="" twine upload
+      -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD
+      --repository-url $PYPI_DESTINATION
+      dist/*
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+.pypi-build-with-poetry:
+  stage: build
+  extends:
+    - .restricted-for-tag
+  cache:
+    key: pypi-deps
+    paths:
+      - $CI_PROJECT_DIR/.poetry-cache
+  image: python:3.10.5-slim
+  before_script:
+    - poetry config cache-dir $CI_PROJECT_DIR/.poetry-cache
+    - poetry config repositories.team-repo $PYPI_DESTINATION
+  script:
+    - poetry version ${CI_COMMIT_TAG/v/}
+    - poetry build
+    - pip install $(find dist/*.whl)
+    - pip uninstall -y $(poetry version | cut -d " " -f 1)
+    - pip install $(find dist/*.gz)
+    - poetry publish -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD -r team-repo

@@ -1,0 +1,13 @@
+include: jobs.yml
+
+test-python:
+  extends: .python-test-job
+
+lint-python:
+  extends: .lint-python
+
+publish:
+  extends: .publish-docker-image
+
+clean-ci-images:
+  extends: .clean-current-docker-image
